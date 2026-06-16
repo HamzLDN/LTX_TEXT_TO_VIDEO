@@ -1,0 +1,181 @@
+# ============================================================
+# dataset_guardian.yml
+# ============================================================
+# What this does:
+#   1. Runs on every push that touches training_images/
+#   2. Validates every image has a caption .txt with the trigger word
+#   3. If validation passes, backs up the dataset to the protected
+#      branch 'dataset-backup' so you never lose curated images
+#      while iterating on training settings
+#
+# Setup (one-time):
+#   a) Set repo secret TRIGGER_WORD = your character's trigger word
+#      (e.g. "hamzchar") — Settings → Secrets → Actions → New secret
+#   b) Create the protected branch:
+#        git checkout --orphan dataset-backup
+#        git commit --allow-empty -m "init backup branch"
+#        git push origin dataset-backup
+#   c) Protect the branch in GitHub:
+#        Settings → Branches → Add rule → "dataset-backup"
+#        ✓ Require pull request before merging
+#        ✓ Do not allow force pushes
+#        ✓ Do not allow deletions
+#
+# Manual trigger:
+#   You can also run this manually from Actions → dataset-guardian
+#   → Run workflow, useful after bulk-editing captions
+# ============================================================
+
+name: Dataset Guardian
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "training_images/**"   # only fires when this folder changes
+  pull_request:
+    branches: [main]
+    paths:
+      - "training_images/**"
+  workflow_dispatch:            # manual trigger from GitHub Actions UI
+
+env:
+  TRAINING_FOLDER: training_images
+  BACKUP_BRANCH: dataset-backup
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 1: Validate every image has a captioned trigger word
+  # ──────────────────────────────────────────────────────────
+  validate-dataset:
+    name: Validate captions & trigger word
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check training_images folder exists
+        run: |
+          if [ ! -d "${{ env.TRAINING_FOLDER }}" ]; then
+            echo "::warning::training_images/ folder not found — creating empty placeholder."
+            mkdir -p "${{ env.TRAINING_FOLDER }}"
+            echo "Add your character images here." > "${{ env.TRAINING_FOLDER }}/README.md"
+          fi
+
+      - name: Count images
+        id: count
+        run: |
+          COUNT=$(find "${{ env.TRAINING_FOLDER }}" \
+            -maxdepth 1 \
+            -type f \
+            \( -iname "*.png" -o -iname "*.jpg" \
+               -o -iname "*.jpeg" -o -iname "*.webp" \) \
+            | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $COUNT image(s) in ${{ env.TRAINING_FOLDER }}/"
+
+      - name: Run caption validator
+        env:
+          TRIGGER_WORD: ${{ secrets.TRIGGER_WORD }}
+        run: |
+          if [ -z "$TRIGGER_WORD" ]; then
+            echo "::error::Secret TRIGGER_WORD is not set."
+            echo "Go to Settings → Secrets → Actions → New secret"
+            echo "Name: TRIGGER_WORD, Value: your trigger word (e.g. hamzchar)"
+            exit 1
+          fi
+          python validate_dataset.py \
+            --folder "${{ env.TRAINING_FOLDER }}" \
+            --trigger "$TRIGGER_WORD"
+
+      - name: Post validation summary
+        if: always()
+        run: |
+          echo "### Dataset Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Folder | \`${{ env.TRAINING_FOLDER }}/\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Images found | ${{ steps.count.outputs.count }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger word | *(from secret)* |" >> $GITHUB_STEP_SUMMARY
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2: Backup validated dataset to protected branch
+  # Only runs after validate-dataset passes, and only on push
+  # to main (not on pull requests — avoids duplicate backups)
+  # ──────────────────────────────────────────────────────────
+  backup-dataset:
+    name: Backup to protected branch
+    runs-on: ubuntu-latest
+    needs: validate-dataset
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    permissions:
+      contents: write   # needed to push to backup branch
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for branch operations
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "Dataset Guardian Bot"
+          git config user.email "actions@github.com"
+
+      - name: Ensure backup branch exists
+        run: |
+          if git ls-remote --exit-code --heads origin "${{ env.BACKUP_BRANCH }}"; then
+            echo "Backup branch exists."
+          else
+            echo "Creating backup branch for the first time..."
+            git checkout --orphan "${{ env.BACKUP_BRANCH }}"
+            git reset --hard
+            git commit --allow-empty -m "chore: initialise dataset backup branch"
+            git push origin "${{ env.BACKUP_BRANCH }}"
+            git checkout main
+          fi
+
+      - name: Sync training_images to backup branch
+        run: |
+          # Copy the validated dataset folder to a temp location
+          cp -r "${{ env.TRAINING_FOLDER }}" /tmp/training_images_backup
+
+          # Switch to backup branch without disturbing working tree
+          git fetch origin "${{ env.BACKUP_BRANCH }}"
+          git checkout "${{ env.BACKUP_BRANCH }}"
+
+          # Remove old backup, replace with fresh validated copy
+          rm -rf "${{ env.TRAINING_FOLDER }}"
+          cp -r /tmp/training_images_backup "${{ env.TRAINING_FOLDER }}"
+
+          # Commit only if something changed
+          git add "${{ env.TRAINING_FOLDER }}"
+          if git diff --staged --quiet; then
+            echo "No changes to dataset — backup already up to date."
+          else
+            COMMIT_MSG="backup: dataset snapshot from main@$(echo '${{ github.sha }}' | cut -c1-7) — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git commit -m "$COMMIT_MSG"
+            git push origin "${{ env.BACKUP_BRANCH }}"
+            echo "✓ Backup pushed to ${{ env.BACKUP_BRANCH }}"
+          fi
+
+      - name: Post backup summary
+        if: always()
+        run: |
+          echo "### Dataset Backup" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backup branch | \`${{ env.BACKUP_BRANCH }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Actor | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
